@@ -1,0 +1,6 @@
+llama_cpp_server/
+__pycache__/
+*.pyc
+.venv/
+*.gguf
+llama-cpp-python/
