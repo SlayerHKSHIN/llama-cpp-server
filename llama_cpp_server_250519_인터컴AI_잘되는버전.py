@@ -27,7 +27,6 @@ def get_api_key(key: str = Depends(api_key_header)):
 
 # --- FastAPI 앱 ---
 app = FastAPI(title="llama-cpp-python Chat API")
-app.counter = 0
 
 # --- 메시지 구조 ---
 class Message(BaseModel):
@@ -87,30 +86,27 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_REQUESTS", "1"))
 INFERENCE_SEM = threading.Semaphore(MAX_CONCURRENT)
 
 # --- 전역 모델 인스턴스 로드 ---
-models: List[Llama] = []
-model_lock = threading.Lock()
-model_index = 0  # round-robin 인덱스
+model: Llama
 
-def load_models():
-    global models
-    for _ in range(2):  # 모델 2개 인스턴스 생성
-        models.append(Llama(
-            model_path   = MODEL_PATH,
-            n_threads    = THREADS,
-            n_ctx        = CTX_SIZE,
-            n_gpu_layers = GPU_LAYERS,
-            low_vram     = LOW_VRAM,
-            verbose      = False,
-        ))
+def load_model():
+    global model
+    model = Llama(
+        model_path   = MODEL_PATH,
+        n_threads    = THREADS,
+        n_ctx        = CTX_SIZE,
+        n_gpu_layers = GPU_LAYERS,
+        low_vram     = LOW_VRAM,
+        verbose      = False,
+    )
     # 워밍업
     try:
-        _ = models[0]("워밍업", max_tokens=1)
+        _ = model("워밍업", max_tokens=1)
     except:
         pass
 
 @app.on_event("startup")
 def on_startup():
-    load_models()
+    load_model()
 
 @app.get("/healthz")
 def healthz():
@@ -151,11 +147,7 @@ async def chat(request: ChatRequest):
 
     INFERENCE_SEM.acquire()
     try:
-        with model_lock:
-            selected_model = models[chat.counter % len(models)]
-            chat.counter += 1
-
-        result = selected_model(prompt_text, max_tokens=request.max_tokens)
+        result = model(prompt_text, max_tokens=request.max_tokens)
 
         # result is expected to be a dict with 'choices' or a dict with 'text'
         if isinstance(result, dict):
