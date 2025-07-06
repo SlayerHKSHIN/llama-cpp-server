@@ -2,7 +2,7 @@ import os
 import time
 import uuid
 from fastapi import FastAPI, HTTPException, Depends, status, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 from llama_cpp import Llama
@@ -150,10 +150,10 @@ class ModelManager:
             print(f"Selected model instance: {model_idx}")
             return model_idx
 
-    def execute(self, model_idx, prompt, max_tokens):
+    def execute(self, model_idx, prompt, max_tokens, stream=False):
         with self.model_locks[model_idx]:
-            print(f"Executing on model instance {model_idx}")
-            return self.models[model_idx](prompt, max_tokens=max_tokens)
+            print(f"Executing on model instance {model_idx} (stream={stream})")
+            return self.models[model_idx](prompt, max_tokens=max_tokens, stream=stream)
 
 # 모델 매니저 인스턴스 생성
 model_manager = None
@@ -172,9 +172,65 @@ def on_startup():
 def healthz():
     return {"status": "ok", "model": MODEL_PATH, "instances": len(model_manager.models) if model_manager else 0}
 
+async def stream_chat_response(model_idx, prompt_text, max_tokens, request_id):
+    """Generate streaming response for chat completions"""
+    try:
+        # Get streaming response from model
+        stream_generator = model_manager.models[model_idx](
+            prompt_text, 
+            max_tokens=max_tokens, 
+            stream=True
+        )
+        
+        accumulated_text = ""
+        for chunk in stream_generator:
+            if isinstance(chunk, dict) and "choices" in chunk:
+                delta_text = chunk["choices"][0]["text"]
+                accumulated_text += delta_text
+                
+                # Create SSE formatted chunk
+                stream_chunk = {
+                    "id": f"chatcmpl-{request_id[:14]}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": os.path.basename(MODEL_PATH),
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "content": delta_text
+                        },
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(stream_chunk)}\n\n"
+        
+        # Send final chunk with finish_reason
+        final_chunk = {
+            "id": f"chatcmpl-{request_id[:14]}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": os.path.basename(MODEL_PATH),
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }
+        yield f"data: {json.dumps(final_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+        
+    except Exception as e:
+        error_chunk = {
+            "error": {
+                "message": str(e),
+                "type": "server_error",
+                "code": 500
+            }
+        }
+        yield f"data: {json.dumps(error_chunk)}\n\n"
+
 @app.post(
     "/v1/chat/completions",
-    response_class=JSONResponse,
     dependencies=[Depends(get_api_key)]
 )
 async def chat(request: ChatRequest):
@@ -246,14 +302,43 @@ async def chat(request: ChatRequest):
         )
 
     request_id = uuid.uuid4().hex
-    print(f"Request {request_id}: Waiting for semaphore")
+    print(f"Request {request_id}: Waiting for semaphore (stream={request.stream})")
+    
+    # Handle streaming response
+    if request.stream:
+        INFERENCE_SEM.acquire()
+        try:
+            print(f"Request {request_id}: Acquired semaphore for streaming")
+            model_idx = model_manager.get_model()
+            print(f"Request {request_id}: Selected model {model_idx} for streaming")
+            
+            # Create generator wrapper that releases semaphore when done
+            async def stream_with_cleanup():
+                try:
+                    async for chunk in stream_chat_response(model_idx, prompt_text, request.max_tokens, request_id):
+                        yield chunk
+                finally:
+                    INFERENCE_SEM.release()
+                    print(f"Request {request_id}: Released semaphore after streaming")
+            
+            # Return streaming response
+            return StreamingResponse(
+                stream_with_cleanup(),
+                media_type="text/event-stream"
+            )
+        except Exception as e:
+            INFERENCE_SEM.release()
+            print(f"Request {request_id}: Error setting up stream: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    # Handle non-streaming response
     INFERENCE_SEM.acquire()
     try:
         print(f"Request {request_id}: Acquired semaphore")
         model_idx = model_manager.get_model()
         print(f"Request {request_id}: Selected model {model_idx}")
 
-        result = model_manager.execute(model_idx, prompt_text, request.max_tokens)
+        result = model_manager.execute(model_idx, prompt_text, request.max_tokens, stream=False)
         print(f"Request {request_id}: Inference completed with model {model_idx}")
 
         if isinstance(result, dict):
