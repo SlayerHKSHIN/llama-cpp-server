@@ -130,7 +130,7 @@ class ModelManager:
                 n_ctx=CTX_SIZE,
                 n_gpu_layers=GPU_LAYERS,
                 low_vram=LOW_VRAM,
-                verbose=False,
+                verbose=True,
             )
             self.models.append(model)
             self.model_locks.append(threading.Lock())
@@ -153,7 +153,33 @@ class ModelManager:
     def execute(self, model_idx, prompt, max_tokens, stream=False):
         with self.model_locks[model_idx]:
             print(f"Executing on model instance {model_idx} (stream={stream})")
-            return self.models[model_idx](prompt, max_tokens=max_tokens, stream=stream)
+            start_time = time.time()
+            result = self.models[model_idx](prompt, max_tokens=max_tokens, stream=stream)
+            
+            # Calculate performance metrics for non-streaming
+            if not stream:
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                
+                # Extract token counts
+                if isinstance(result, dict):
+                    completion_tokens = result.get("usage", {}).get("n_eval", 0)
+                    prompt_tokens = result.get("usage", {}).get("n_prompt", 0)
+                    
+                    # Calculate tokens per second
+                    if elapsed_time > 0 and completion_tokens > 0:
+                        tokens_per_second = completion_tokens / elapsed_time
+                        print(f"Performance Metrics:")
+                        print(f"  - Prompt tokens: {prompt_tokens}")
+                        print(f"  - Completion tokens: {completion_tokens}")
+                        print(f"  - Total time: {elapsed_time:.2f}s")
+                        print(f"  - Generation speed: {tokens_per_second:.2f} tokens/s")
+                        
+                        # Also log to file
+                        with open("/tmp/llm_performance.log", "a") as f:
+                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Model {model_idx}: {tokens_per_second:.2f} tok/s, {completion_tokens} tokens in {elapsed_time:.2f}s\n")
+            
+            return result
 
 # 모델 매니저 인스턴스 생성
 model_manager = None
@@ -175,6 +201,9 @@ def healthz():
 async def stream_chat_response(model_idx, prompt_text, max_tokens, request_id):
     """Generate streaming response for chat completions"""
     try:
+        start_time = time.time()
+        token_count = 0
+        
         # Get streaming response from model
         stream_generator = model_manager.models[model_idx](
             prompt_text, 
@@ -187,6 +216,7 @@ async def stream_chat_response(model_idx, prompt_text, max_tokens, request_id):
             if isinstance(chunk, dict) and "choices" in chunk:
                 delta_text = chunk["choices"][0]["text"]
                 accumulated_text += delta_text
+                token_count += 1  # Approximate token count
                 
                 # Create SSE formatted chunk
                 stream_chunk = {
@@ -203,6 +233,18 @@ async def stream_chat_response(model_idx, prompt_text, max_tokens, request_id):
                     }]
                 }
                 yield f"data: {json.dumps(stream_chunk)}\n\n"
+        
+        # Calculate streaming performance
+        elapsed_time = time.time() - start_time
+        if elapsed_time > 0 and token_count > 0:
+            tokens_per_second = token_count / elapsed_time
+            print(f"Streaming Performance Metrics:")
+            print(f"  - Approximate tokens generated: {token_count}")
+            print(f"  - Total time: {elapsed_time:.2f}s")
+            print(f"  - Generation speed: {tokens_per_second:.2f} tokens/s")
+            
+            with open("/tmp/llm_performance.log", "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Model {model_idx} (streaming): {tokens_per_second:.2f} tok/s, {token_count} tokens in {elapsed_time:.2f}s\n")
         
         # Send final chunk with finish_reason
         final_chunk = {
